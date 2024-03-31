@@ -30,7 +30,7 @@ PyRedis is a lightweight, in-memory key-value store server, written in Python, t
 
 ## Running the Server
 
-To start the PyRedisClone server, ensure you have Python installed on your machine, navigate to the project directory in your terminal, and run:
+To start the PyRedis server, ensure you have Python installed on your machine, navigate to the project directory in your terminal, and run:
 
 ```bash
 python server.py
