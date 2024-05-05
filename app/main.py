@@ -2,8 +2,17 @@ import socket
 import threading
 import time
 
+# Arguement Parser
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("-p", "--port", help="Port Number")
+parser.add_argument("--replicaof", nargs=2, help="Replicate to another redis instance")
+
 # In-memory key-value store
 key_value_store = {}
+is_replica = False
+master_replid = '8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb'
+master_repl_offset = 0
 
 # Parser function for Redis protocol
 def parse_redis_protocol(data):
@@ -50,6 +59,14 @@ def handle_get_command(clientsocket, parsed_command):
         clientsocket.sendall(b"$-1\r\n")
 
 
+def handle_info_command(clientsocket, parsed_command):
+    global is_replica, master_replid, master_repl_offset
+    if parsed_command[1] == 'replication':
+        if is_replica:
+            clientsocket.sendall(b"$10\r\nrole:slave\r\n")
+        else:
+            clientsocket.sendall(f"${2 + 11 + len(master_replid) + len('master_replid:') + len(str(master_repl_offset)) + len('master_repl_offset:')}\r\nrole:master,master_replid:{master_replid},master_repl_offset:{master_repl_offset}\r\n".encode())
+
 def on_new_client(clientsocket, addr):
     print(f"Connected by {addr}")
     while True:
@@ -73,8 +90,12 @@ def on_new_client(clientsocket, addr):
         elif parsed_command[0].lower() == 'get' and len(parsed_command) == 2:
             handle_get_command(clientsocket, parsed_command)
         
+        # Handling the INFO command
+        elif parsed_command[0].lower() == 'info' and len(parsed_command) == 2:
+            handle_info_command(clientsocket, parsed_command)
+        
         # Handling the echo command
-        elif parsed_command[0] == 'echo' and len(parsed_command) > 1:
+        elif parsed_command[0] == 'ECHO' and len(parsed_command) > 1:
             response_message = f"+{parsed_command[1]}\r\n"
             clientsocket.sendall(response_message.encode())
         
@@ -82,11 +103,62 @@ def on_new_client(clientsocket, addr):
             clientsocket.sendall(b"+PONG\r\n")
     clientsocket.close()
 
+
+def replicate_to_master(master_host, master_port, portNumber):
+    global is_replica
+    while True:
+        try:
+            master_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            master_socket.connect((master_host, master_port))
+            is_replica = True
+
+            # Part 1 of the handshake
+            master_socket.sendall(b"*1\r\n$4\r\nPING\r\n")
+            # Wait for response to PING
+            data = master_socket.recv(1024)
+            if data != b"+PONG\r\n":
+                print("Failed to receive response to PING")
+                return
+
+            # Part 2 of the handshake
+            master_socket.sendall(b"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n6380\r\n")
+            master_socket.sendall(b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n")
+
+            # Wait for response to REPLCONF
+            for _ in range(2):
+                data = master_socket.recv(1024)
+                if data != b"+OK\r\n":
+                    print("Failed to receive response to REPLCONF")
+                    return
+            
+            # Third Part of the handshake
+            # Sending PSYNC
+            master_socket.sendall(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+            
+            # data = master_socket.recv(1024)
+            # if data != b"+PONG\r\n":
+            #     print("Failed to receive response to PING")
+            #     return
+
+        except Exception as e:
+            print("Error in replication:", e)
+
 def main():
     print("Logs from your program will appear here!")
 
+    portNumber = 6379
+    args = parser.parse_args()
+    if args.port:
+        portNumber = int(args.port)
+
+    if args.replicaof:
+        master_host, master_port = args.replicaof
+        master_port = int(master_port)
+        threading.Thread(target=replicate_to_master, args=(master_host, master_port, portNumber)).start()
+
+
     try:
-        server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
+        server_socket = socket.create_server(("localhost", portNumber), reuse_port=True)
         
         while True:
             conn, addr = server_socket.accept() # wait for client
