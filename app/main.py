@@ -1,3 +1,4 @@
+import base64
 import socket
 import threading
 import time
@@ -13,6 +14,9 @@ key_value_store = {}
 is_replica = False
 master_replid = '8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb'
 master_repl_offset = 0
+
+# Empty RDB file content (base64 representation)
+EMPTY_RDB_BASE64 = b"UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog=="
 
 # Parser function for Redis protocol
 def parse_redis_protocol(data):
@@ -139,6 +143,11 @@ def replicate_to_master(master_host, master_port, portNumber):
             # if data != b"+PONG\r\n":
             #     print("Failed to receive response to PING")
             #     return
+            # Send empty RDB file
+            rdb_content = base64.b64decode(EMPTY_RDB_BASE64)
+            rdb_length = len(rdb_content)
+            master_socket.sendall(b"$" + str(rdb_length).encode() + b"\r\n" + rdb_content)
+
 
         except Exception as e:
             print("Error in replication:", e)
