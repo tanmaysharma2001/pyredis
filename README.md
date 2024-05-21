@@ -28,6 +28,12 @@ PyRedis is a lightweight, in-memory key-value store server, written in Python, t
 - **Description**: Keys can be set with an expiry time in milliseconds using the `PX` argument in the `SET` command. Expired keys are automatically removed from the store and are not retrievable with the `GET` command.
 - **Usage**: Included as part of the `SET` command with the `PX` argument.
 
+### Replication
+
+- **Description**: Supports basic replication functionality, allowing one PyRedis server to act as a replica of another PyRedis server.
+- **Usage**: --replicaof <host> <port>
+- **Extended Feature**: Replication is supported between PyRedis instances. A server can be started as a replica of another server using the --replicaof option, allowing data synchronization from the master to the replica.
+
 ## Running the Server
 
 To start the PyRedis server, ensure you have Python installed on your machine, navigate to the project directory in your terminal, and run:
