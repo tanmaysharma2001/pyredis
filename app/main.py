@@ -1,11 +1,13 @@
 import asyncio
 import base64
 import socket
+import struct
 import threading
 from threading import Thread
 import time
 import re
 import argparse
+import os
 
 # Lock for thread safety
 lock = threading.Lock()
@@ -13,21 +15,34 @@ lock = threading.Lock()
 parser = argparse.ArgumentParser()
 parser.add_argument("-p", "--port", help="Port Number", type=int)
 parser.add_argument("--replicaof", nargs=1, help="Replicate to another redis instance")
+parser.add_argument("--dir", nargs=1, help="Path of the directory for RDB File.")
+parser.add_argument("--dbfilename", nargs=1, help="Name of the RDB File.")
+
+# RDB File Configurations
+rdb_file_dir = None
+rdb_file_name = None
+
+# ROLE VARIABLE: changed on the type of Node started.
+role = "master"
+is_replica = False
 
 # In-memory key-value store
 key_value_store = {}
+
+# Master Replication ID and OffSet
 master_replid = '8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb'
 master_repl_offset = 0
 
 # Master HOST and PORT
 master_host = ''
 master_port = ''
+
+# Replicas connected to the Master Node
 replicas = []
 
+# ----------- REPLICA ----------------
 # MASTER SOCKET for Replica
 master_socket = None
-role = "master"
-is_replica = False
 replica_offset = 0
 
 # Empty RDB file content (base64 representation)
@@ -49,8 +64,7 @@ def handle_set_command(parsed_command):
 
 def handle_get_command(parsed_command):
     key = parsed_command[1]
-    with lock:
-        value, expiry = key_value_store.get(key, (None, None))
+    value, expiry = key_value_store.get(key, (None, None))
     if value is not None:
         # Check if the key has expired
         if expiry is not None and int(time.time() * 1000) > expiry:
@@ -82,6 +96,9 @@ def handle_command(parsed_command, writer=None):
     global is_replica
     responses = []
 
+    # Reading RDB File before executing any command
+    read_rdb_file()
+
     if parsed_command[0] == 'set':
         handle_set_command(parsed_command)
         if not is_replica:
@@ -93,6 +110,7 @@ def handle_command(parsed_command, writer=None):
 
     # Handling GET command
     elif parsed_command[0] == 'get' and len(parsed_command) == 2:
+        # Return from the Key Value Store just read from the RDB file
         responses.append(handle_get_command(parsed_command))
 
     # Handling the INFO command
@@ -122,10 +140,94 @@ def handle_command(parsed_command, writer=None):
         rdb_content = base64.b64decode(EMPTY_RDB_FILE)
         rdb_length = len(rdb_content)
         responses.append(f"${rdb_length}\r\n".encode() + rdb_content)
+
+    # CONFIG GET command
+    elif parsed_command[0] == 'config' and len(parsed_command) > 2:
+        if parsed_command[2] == 'dir' and rdb_file_dir:
+            responses.append(f'*2\r\n$3\r\ndir\r\n${len(rdb_file_dir)}\r\n{rdb_file_dir}\r\n'.encode())
+
+    elif parsed_command[0] == 'keys' and parsed_command[1] == '*':
+        response = None
+        number_keys = len(key_value_store.keys())
+        print(number_keys)
+        response = f"*{number_keys}\r\n"
+        for key in key_value_store.keys():
+            response = response + f'${len(key)}\r\n{key}\r\n'
+        if response:
+            responses.append(response.encode())
+        else:
+            responses.append(b"*0\r\n")
     else:
         responses.append(b"+PONG\r\n")
 
     return responses
+
+
+def seek_till_key_value_pairs(file):
+    # read till we reach RESIZEDB opcode
+    while op := file.read(1):
+        if op == b"\xfb":
+            break
+
+    # next 2 bytes are sizes of the hashtable
+    # after this key-value pairs will be available
+    file.read(2)
+
+
+def read_unsigned_char(file):
+    return struct.unpack("B", file.read(1))[0]
+
+
+
+def get_string_len(file):
+    first_byte = read_unsigned_char(file)
+    match first_byte:
+        case x if x >> 6 == 0b00:
+            # 00 -> The next 6 bits represent the length of the string
+            return first_byte & 0b00111111
+        case _:
+            print("Invalid first byte", first_byte)
+
+
+def read_string(file):
+    length = get_string_len(file)
+    return file.read(length).decode()
+
+def read_key_value_pairs(file):
+    while True:
+        op = read_unsigned_char(file)
+        match op:
+            case 0xFF:
+                print("EOF")
+                break
+            case value_type:
+                key = read_string(file)
+                value = read_string(file)
+                print("value_type =>", value_type, key, value)
+                key_value_store[key] = (value, None)
+
+def prepare_bulkstring(values):
+    result = []
+    # number of values prefixed by star
+    result.append(f"*{len(values)}")
+    for value in values:
+        # length of value prefixed by dollar and then the actual value
+        result.append(f"${len(value)}")
+        result.append(value)
+    # we need to end with a CRLF too
+    result.append("")
+    # each line is terminated by \r\n
+    return "\r\n".join(result).encode()
+
+def read_rdb_file():
+    global rdb_file_dir, rdb_file_name
+    if rdb_file_dir and rdb_file_name:
+        rdb_file_path = os.path.join(rdb_file_dir, rdb_file_name)
+        if os.path.exists(rdb_file_path):
+            with open(rdb_file_path, 'rb') as f:
+                # reading the file
+                seek_till_key_value_pairs(f)
+                read_key_value_pairs(f)
 
 
 # Parser function for Redis protocol
@@ -149,7 +251,6 @@ def parse_redis_protocol(data):
     )
     command_list[0] = command_list[0].lower()
     return command_list
-
 
 async def on_new_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     global is_replica, replicas
@@ -188,11 +289,11 @@ def get_from_master(master_socket: socket.socket):
         try:
             # print("next master ")
             data = master_socket.recv(4039)  # .decode("utf-8")
+
             if data:
-                print(data)
                 pattern = r'\*[\d]+\r\n(?:\$[\d]+\r\n[^\r\n]+\r\n)+'
                 command_list = re.findall(pattern, data.decode('utf-8'))
-                print(command_list)
+
                 for command in command_list:
                     if command:
                         # if command.startswith(b'+FULLRESYNC') or command.startswith(b'*\r\n'):
@@ -254,7 +355,7 @@ async def create_server(master_host, master_port, port_number):
 
 
 def main():
-    global role, master_host, master_port
+    global role, master_host, master_port, rdb_file_dir, rdb_file_name
     print("Logs from your program will appear here!")
 
     port_number = 6379
@@ -263,6 +364,13 @@ def main():
         port_number = args.port
 
     role = "master"
+
+    # Parse the RDB file directory and name
+    if args.dir:
+        rdb_file_dir = args.dir[0]
+
+    if args.dbfilename:
+        rdb_file_name = args.dbfilename[0]
 
     if args.replicaof:
         master_address = args.replicaof
